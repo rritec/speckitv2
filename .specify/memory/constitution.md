@@ -1,7 +1,7 @@
 <!-- 
 Sync Impact Report
 ==================
-Version: 1.4.0 (Minor Update - Audit Lakehouse & Logging)
+Version: 1.5.0 (Minor Update - Quality, Error Handling, Testing Standards)
 Ratification: 2026-04-13
 Last Amended: 2026-04-13
 
@@ -20,20 +20,22 @@ Added Sections:
   - Warehouse Consumption Standards
   - Landing Layer File Backup (Post-Raw Layer Creation)
   - Workspace & Environment Structure
-  - Audit & Logging Standards **NEW**
+  - Audit & Logging Standards
+  - Data Quality Thresholds & Validation Standards **NEW**
+  - Error Handling & Alerting Standards **NEW**
+  - Testing Standards & Quality Gates **NEW**
 
-Amendments (v1.3.0 → v1.4.0):
-  - Added dedicated Audit Lakehouse: lh_audit
-  - Defined audit tables: pipeline_execution_log, data_quality_metrics, lineage_tracking, schema_changes, backup_execution_log
-  - Set retention policy: 3 years (1095 days) for all audit records
-  - Access control: Read-only for users, append-only for service principals, no delete operations
-  - Automatic quarterly purge of records older than 3 years
-  - Added AuditLogger.py notebook for audit logging to lh_audit
-  - Updated workspace structure to include lh_audit in all environments (Dev, Test, Prod)
+Amendments (v1.4.0 → v1.5.0):
+  - Added Data Quality Thresholds: null tolerance (5%), quality scores (80%), SLA targets (30/60/45 min layers, 05:00 UTC daily)
+  - Added Error Handling: failure levels (CRITICAL/WARNING/INFO), retry logic (3x exponential backoff), notification channels (Slack/Email/Dashboard)
+  - Added Testing Standards: unit test coverage (80%+), integration tests (mandatory for new entities), regression testing (pre/post validation)
+  - Added Promotion Workflow: Dev → Test → Prod with code review, integration testing, UAT sign-off
+  - Added Recovery Procedures: layer-specific rollback steps, idempotent re-execution guarantees
+  - Added SLA Targets: overall pipeline completion by 05:00 UTC, data freshness ≤ 24 hours
 
 Templates Requiring Attention:
   - spec-template.md: ✅ Scope verification complete
-  - tasks-template.md: ✅ Task categorization aligned (audit table creation tasks)
+  - tasks-template.md: ✅ Task categorization aligned (quality gates, testing tasks)
   - plan-template.md: ✅ Architecture check complete
 -->
 
@@ -113,6 +115,97 @@ Consumption layer (Warehouse) MUST implement Microsoft Fabric Warehouse identity
 - **Access**: Read-only for most users; insert/append-only for audit logger service principal; no delete/update operations on existing audit records.
 - **Automatic Purge**: Automated job removes records older than 3 years (on schedule: quarterly purge on Jan 1, Apr 1, Jul 1, Oct 1, 00:00 UTC).
 
+## Data Quality Thresholds & Validation Standards
+
+**Quality Gate Rules (NON-NEGOTIABLE)**:
+- **Raw Layer**:
+  - Null tolerance: ≤ 5% nulls per column → mark `DataQualityFlag = false` for affected rows (do not filter).
+  - Duplicate detection: No business-key duplicates allowed; exact duplicates must be logged with `ProcessingStatus = "warning"`.
+  - Schema compliance: All expected columns present; missing columns → `ProcessingStatus = "error"`, pipeline fails with alert.
+  - Row-count parity: Previous day row count deviation > 20% (up or down) → trigger investigation alert (non-blocking).
+
+- **Integration Layer**:
+  - Data completeness: ≥ 95% of source rows must map to Integration tables (transformation drop-off > 5% triggers alert).
+  - Column quality: `DataQualityScore` ≥ 80% per column; <80% → marked as `LineageVersion._validation_needed`.
+  - Referential integrity: Foreign keys to dimension tables must exist (validate before insert); missing → quarantine row with alert.
+  - Business logic validation: Custom rules per entity (e.g., `OrderAmount > 0`, `OrderDate <= ProcessDate`); failures logged to `data_quality_metrics`.
+
+- **Warehouse Consumption Layer**:
+  - Identity column uniqueness: Surrogate keys must be unique (no duplicates); primary key violation → rollback transaction.
+  - Fact table grain: No duplicate grain keys (combination of dimension keys + measure keys); duplicates → alert and investigation.
+  - SCD Type-2 integrity: No overlapping effective date ranges; `IsCurrent` flag correct; violations → quarantine & alert.
+
+**SLA Targets**:
+- Landing → Raw transformation: Must complete within **30 minutes** of file arrival (alert if exceeded).
+- Raw → Integration transformation: Must complete within **60 minutes** (alert if exceeded).
+- Integration → Warehouse load: Must complete within **45 minutes** (alert if exceeded).
+- Overall pipeline SLA: Must complete daily cycle by **05:00 UTC** (alert if exceeded).
+- Data freshness: Latest data in Warehouse must be ≤ 24 hours old (alert if stale).
+
+## Error Handling & Alerting Standards
+
+**Failure Detection & Response**:
+- **Pipeline Failure Levels**:
+  - **CRITICAL** (automatic retry + notify lead): Schema errors, identity key violation, file not found, pipeline timeout.
+  - **WARNING** (log + notify team): 5-20% data drop-off, any DataQualityFlag failures, SCD integrity warnings.
+  - **INFO** (log only): Null tolerance at edge cases, minor deviations in row counts.
+
+- **Retry Logic**:
+  - CRITICAL failures: Automatic retry up to 3 times (exponential backoff: 5s, 10s, 30s).
+  - If retries exhaust: Escalate to alert (see notification channels below).
+  - Manual intervention required if retry count exceeds 3.
+
+- **Notification Channels**:
+  - **Slack** (immediate): All CRITICAL failures, SLA breaches → channel `#rritec-fabric-pipeline`
+  - **Email** (hourly digest): WARNING-level issues, quality threshold violations → team@rritec.com
+  - **Dashboard** (real-time): Custom Warehouse dashboard tracking pipeline health, failure counts, quality metrics.
+  - **Escalation**: If CRITICAL unresolved > 1 hour → page on-call data engineer.
+
+- **Error Logging**:
+  - All errors logged to `pipeline_execution_log` with stack trace, affected rows, recovery action taken.
+  - Error context includes: environment (Dev/Test/Prod), layer (Landing/Raw/Integration/Warehouse), entity name, timestamp, user/SP identity.
+  - Errors queryable via Warehouse dashboard for troubleshooting & root cause analysis.
+
+**Recovery Procedures**:
+- **Raw Layer Failure**: Rerun `LandingToRaw.py`; overwrite mode guarantees idempotent re-execution (no duplicates).
+- **Integration Layer Failure**: Rerun `RawToIntegration.py`; inspect quality metrics before retry.
+- **Warehouse Load Failure**: Validate SCD & key integrity; rollback transaction; fix schema/constraints; rerun `IntegrationToWarehouse.py`.
+- **Backup Failure**: Alert but do not block downstream (backup retry scheduled next 6 hours; manual intervention if 3 failures).
+
+## Testing Standards & Quality Gates
+
+**Test Coverage Requirements (MANDATORY)**:
+- **Unit Tests**: ≥ 80% code coverage for all transformation logic (PySpark functions, business rules).
+  - Test frameworks: pytest (Python), with Spark mock fixtures.
+  - Test file location: `tests/unit/test_{notebook_name}.py` in Git repository.
+  - Run before PR submission: `pytest tests/unit/` must pass 100%.
+
+- **Integration Tests**: Mandatory for all new entities and schema changes.
+  - Dry-run on Test workspace: Full pipeline execution with small dataset (last 7 days).
+  - Validate: Row counts, quality metrics, SCD integrity, audit logs written correctly.
+  - Test file location: `.specify/templates/integration-test-plan.md` for each entity.
+  - Required frequency: Daily (before production schedule activation).
+
+- **Regression Tests**: Any transformation change requires before-and-after validation.
+  - Compare: Row counts, column distributions, null patterns, quality scores pre/post change.
+  - Test data: Production sample from previous day; run new code on same data; confirm no data loss/corruption.
+  - Sign-off: Data engineering lead approves regression results before Prod deployment.
+
+**Promotion Workflow (Dev → Test → Prod)**:
+1. Developer: Git commit on feature branch, unit tests pass (80%+ coverage).
+2. Code Review: Data engineering lead reviews transformations, audit logging, error handling.
+3. Test Promotion: Merge to test branch → automatic run on Test workspace.
+4. Integration Test: Full pipeline runs; quality gates validated; manual sign-off required.
+5. Prod Promotion: Tag release version in Git (`v1.x.x`); merge to main branch.
+6. Prod Execution: Scheduled pipeline runs; monitoring active; rollback plan documented.
+7. Post-Deploy Validation: Verify Prod data matches expected quality metrics within 1 hour of load.
+
+**UAT Sign-Off**:
+- Business stakeholders required to validate sample records in Warehouse (min 50 rows per entity).
+- Spot-check: Compare 5 random records Warehouse vs. source system; 100% accuracy required.
+- Quality sign-off: Data quality metrics acceptable; no critical issues blocking production release.
+- Formal approval: Email sign-off from business data owner before final Prod deployment.
+
 ## Transformation & Integration Standards
 
 **Integration Layer Responsibilities**:
@@ -176,4 +269,4 @@ All pipelines and notebooks MUST verify compliance with this Constitution during
 4
 Version control: Every pipeline modification is logged with rationale; lineage metadata is preserved in audit columns. Quarterly council reviews ensure ongoing alignment.
 
-**Version**: 1.3.0 | **Ratified**: 2026-04-13 | **Last Amended**: 2026-04-13
+**Version**: 1.5.0 | **Ratified**: 2026-04-13 | **Last Amended**: 2026-04-13
